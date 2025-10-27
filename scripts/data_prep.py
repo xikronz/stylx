@@ -14,19 +14,23 @@ class DataPrep:
         return self.data
 
     def preprocess_data(self):
-        """Extract sentences by removing newlines and splitting on periods."""
+        """Extract sentences by removing page numbers, newlines, and splitting on periods 
+        — but not after abbreviations like Mr. or Ms."""
         if self.data is None:
             raise ValueError("Data not loaded. Call load_data() first.")
         
-        text = self.data.replace('\n', ' ')
-        
+        text = self.data
+        text = re.sub(r'\b\d+\s*\n', '', text)
+        text = text.replace('\n', ' ')
         text = re.sub(r'\s+', ' ', text)
-        sentences = re.split(r'\.(?=\s+[A-Z])', text)
+        
+        sentences = re.split(
+            r'(?<!\bMr)(?<!\bMs)(?<!\bMrs)(?<!\bDr)\.(?=\s+[A-Z])',
+            text
+        )
+        
         sentences = [s.strip() + '.' for s in sentences if s.strip()]
-        
         sentences = [s[:-1] if s.endswith('..') else s for s in sentences]
-        
-        sentences = [s for s in sentences if len(s) > 3]
         
         return sentences
 
@@ -61,7 +65,13 @@ class DataPrep:
             
 
 if __name__ == "__main__":
-    csv_path = '/home/cc2864/Documents/cs6784/kafka_sentences.csv'
+
+    preprep = DataPrep('/home/xikron/Documents/Cornell 2028/Academic/Sophmore/Fall/CS-6784-Sun/stylx/Wuthering Heights.txt')
+    preprep.load_data()
+    sentences = preprep.preprocess_data()
+
+    csv_path = '/home/xikron/Documents/Cornell 2028/Academic/Sophmore/Fall/CS-6784-Sun/stylx/data/withering_heights_sentences.csv'
+    df =  preprep.save_to_csv(sentences, csv_path)
     prep = DataPrep(csv_path)
     
     print("Loading sentences from CSV...")
@@ -78,5 +88,5 @@ if __name__ == "__main__":
     for i, sent in enumerate(merged_sentences[:3], 1):
         print(f"\n{i}. {sent[:200]}..." if len(sent) > 200 else f"\n{i}. {sent}")
     
-    output_path = '/home/cc2864/Documents/cs6784/kafka_sentences_merged.csv'
+    output_path = '/home/xikron/Documents/Cornell 2028/Academic/Sophmore/Fall/CS-6784-Sun/stylx/data/withering_heights_merged.csv'
     prep.save_to_csv(merged_sentences, output_path)
