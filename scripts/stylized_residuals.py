@@ -426,9 +426,9 @@ if __name__ == "__main__":
     torch.cuda.empty_cache()
 
     analyzer = StylizedResiduals(
-        original_text_path='kafka_sentences_merged.csv',
-        output_data_path='kafka_unstylized_sentences.csv', 
-        stripped_text_path='kafka_unstylized_sentences_checkpoint.csv'
+        original_text_path='..data/kafka_sentences_merged.csv',
+        output_data_path='..data/kafka_unstylized_sentences.csv', 
+        stripped_text_path='..data/kafka_unstylized_sentences_checkpoint.csv'
     )
 
     stylized_df = pd.read_csv(analyzer.original_text_path)
