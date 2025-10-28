@@ -1,0 +1,14 @@
+Stylized Residuals Analysis Summary
+========================================
+
+num_residuals: 981
+residual_dim: 768
+
+Residual Norms
+mean=2.789118 std=0.756751 min=1.223804 q25=2.229187 median=2.712078 q75=3.235886 max=5.716076
+
+Cosine to Average Vector
+mean=0.243991 std=0.114324 min=-0.117232 q25=0.173873 median=0.244303 q75=0.319011 max=0.582834
+
+Top-k Neighbor Cosine Similarities
+k=10 mean=0.26015371084213257 median=0.25463539361953735 std=0.05214095488190651

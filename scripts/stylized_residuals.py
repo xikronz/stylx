@@ -5,9 +5,12 @@ import seaborn as sns
 import pandas as pd 
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import normalize
+from sklearn.neighbors import NearestNeighbors
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+import os 
+os.chdir('..')
 
 class StylizedResiduals:
     """
@@ -23,17 +26,32 @@ class StylizedResiduals:
             output_data_path: Path to save output CSV files
             stripped_text_path: Path to text that have been stripped from their "style"
         """
-        print("Loading models... This may take a while.")
-        self.model = SentenceTransformer("Qwen/Qwen3-Embedding-8B")
-        self.translator = AutoModelForCausalLM.from_pretrained("tencent/Hunyuan-MT-7B", device_map="auto")
-        self.tokenizer = AutoTokenizer.from_pretrained("tencent/Hunyuan-MT-7B")
-        print("Models loaded successfully!")
+        print("Loading embedding model... This may take a while.")
+        self.preferred_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.model = SentenceTransformer("sentence-transformers/multi-qa-mpnet-base-dot-v1", device=self.preferred_device)
+        #lazy-load translator to avoid occupying GPU unless needed
+        self.translator = None
+        self.tokenizer = None
+        print("Embedding model loaded successfully!")
         
         self.original_language = "English"
         self.target_languages = ["French", "German", "Dutch"] 
         self.original_text_path = original_text_path
         self.output_data_path = output_data_path
         self.stripped_text_path = stripped_text_path
+        
+        #analysis/visualization scalability settings
+        self.max_heatmap_sample_size = 200  # cap for pairwise heatmaps
+        self.max_scatter_points = 5000      # cap before switching to hexbin
+        self.topk_neighbors = 10            # for local similarity stats
+
+    def _ensure_translator_loaded(self):
+        if self.translator is None or self.tokenizer is None:
+            print("Loading translation model on demand...")
+            #prefer CPU for translation to keep GPU memory for embeddings
+            self.translator = AutoModelForCausalLM.from_pretrained("tencent/Hunyuan-MT-7B", device_map="cpu")
+            self.tokenizer = AutoTokenizer.from_pretrained("tencent/Hunyuan-MT-7B")
+            print("Translation model loaded.")
 
     def translate_to_target(self, sentence, target_language):
         """
@@ -46,6 +64,7 @@ class StylizedResiduals:
         Returns:
             Translated text
         """
+        self._ensure_translator_loaded()
         messages = [
             {"role": "user", "content": f"Translate the following segment into {target_language}, without additional explanation.\n\n{sentence}"},
         ]
@@ -168,7 +187,43 @@ class StylizedResiduals:
         
         return unstylized_text
 
-    def compute_residuals(self, stylized, unstylized):
+    def _encode_with_retry(self, texts, batch_size=64, show_progress_bar=True):
+        """
+        Encode texts with automatic batch size reduction and CPU fallback on CUDA OOM.
+        """
+        bs = max(1, batch_size)
+        device_now = self.model.device if hasattr(self.model, 'device') else self.preferred_device
+        while True:
+            try:
+                return self.model.encode(
+                    texts,
+                    batch_size=bs,
+                    convert_to_numpy=True,
+                    show_progress_bar=show_progress_bar,
+                )
+            except RuntimeError as e:
+                oom = isinstance(e, torch.cuda.OutOfMemoryError) or 'CUDA out of memory' in str(e)
+                if oom:
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    if bs > 1:
+                        bs = max(1, bs // 2)
+                        print(f"CUDA OOM during encode. Reducing batch size to {bs} and retrying...")
+                        continue
+                    #move to CPU and retry
+                    if self.preferred_device == 'cuda':
+                        print("CUDA OOM at batch_size=1. Falling back to CPU for encoding...")
+                        try:
+                            self.model.to('cpu')
+                        except Exception:
+                            pass
+                        self.preferred_device = 'cpu'
+                        continue
+                raise
+
+    def compute_residuals(self, stylized, unstylized, batch_size=64):
         """
         Compute embedding residuals between stylized and unstylized text.
         
@@ -179,16 +234,10 @@ class StylizedResiduals:
         Returns:
             numpy array of residual vectors
         """
-        residuals = []
-        
-        for i in range(len(stylized)):
-            stylized_enc = self.model.encode(stylized[i], convert_to_numpy=True)
-            unstylized_enc = self.model.encode(unstylized[i], convert_to_numpy=True)
-            
-            diff = stylized_enc - unstylized_enc
-            residuals.append(diff)
-
-        residuals = np.array(residuals)
+        #batch encode for scalability
+        stylized_enc = self._encode_with_retry(stylized, batch_size=batch_size, show_progress_bar=True)
+        unstylized_enc = self._encode_with_retry(unstylized, batch_size=batch_size, show_progress_bar=True)
+        residuals = stylized_enc - unstylized_enc
         print(f"Computed {len(residuals)} residuals with dimension {residuals.shape[1]}")
         return residuals
 
@@ -207,8 +256,16 @@ class StylizedResiduals:
         print("=" * 60)
         residual_norms = np.linalg.norm(residuals, axis=1)
         
-        for i, norm in enumerate(residual_norms):
-            print(f"Pair {i+1}: ||residual|| = {norm:.4f}")
+        if len(residual_norms) <= 50:
+            for i, norm in enumerate(residual_norms):
+                print(f"Pair {i+1}: ||residual|| = {norm:.4f}")
+        else:
+            q = np.quantile(residual_norms, [0.0, 0.25, 0.5, 0.75, 1.0])
+            print(
+                f"Count={len(residual_norms)} | mean={residual_norms.mean():.4f} "+
+                f"std={residual_norms.std():.4f} | min={q[0]:.4f} q25={q[1]:.4f} "+
+                f"median={q[2]:.4f} q75={q[3]:.4f} max={q[4]:.4f}"
+            )
         
         return residual_norms
 
@@ -227,15 +284,21 @@ class StylizedResiduals:
         print("COSINE SIMILARITY WITH AVERAGE STYLE VECTOR")
         print("=" * 60)
         
-        cosines = []
-        for i, residual in enumerate(residuals):
-            cosine_sim = np.dot(residual, avg_style_vector) / (
-                np.linalg.norm(residual) * np.linalg.norm(avg_style_vector)
-            )
-            cosines.append(cosine_sim)
-            print(f"Pair {i+1}: cosine similarity = {cosine_sim:.4f}")
+        #vectorized cosine similarity
+        denom = (np.linalg.norm(residuals, axis=1) * (np.linalg.norm(avg_style_vector) + 1e-12))
+        cosines = (residuals @ avg_style_vector) / np.clip(denom, 1e-12, None)
 
-        return np.array(cosines)
+        if len(cosines) <= 50:
+            for i, cosine_sim in enumerate(cosines):
+                print(f"Pair {i+1}: cosine similarity = {cosine_sim:.4f}")
+        else:
+            q = np.quantile(cosines, [0.0, 0.25, 0.5, 0.75, 1.0])
+            print(
+                f"Count={len(cosines)} | mean={cosines.mean():.4f} std={cosines.std():.4f} "
+                f"min={q[0]:.4f} q25={q[1]:.4f} median={q[2]:.4f} q75={q[3]:.4f} max={q[4]:.4f}"
+            )
+
+        return cosines
 
     def compute_similarity_matrix(self, residuals):
         """
@@ -251,10 +314,17 @@ class StylizedResiduals:
         print("PAIRWISE COSINE SIMILARITY MATRIX")
         print("=" * 60)
         
+        n = len(residuals)
+        if n > self.max_heatmap_sample_size:
+            print(
+                f"Dataset too large for full pairwise matrix (n={n}). "
+                f"Skipping full computation; will sample in visualization."
+            )
+            return None
         residuals_normalized = normalize(residuals, axis=1)
         similarity_matrix = residuals_normalized @ residuals_normalized.T
         
-        mean_off_diag = (similarity_matrix.sum() - len(residuals)) / (len(residuals) * (len(residuals) - 1))
+        mean_off_diag = (similarity_matrix.sum() - n) / (n * (n - 1)) if n > 1 else 1.0
         print(f"Mean off-diagonal similarity: {mean_off_diag:.4f}")
         
         return similarity_matrix
@@ -273,6 +343,13 @@ class StylizedResiduals:
         print("DOT PRODUCTS BETWEEN RESIDUALS")
         print("=" * 60)
         
+        n = len(residuals)
+        if n > self.max_heatmap_sample_size:
+            print(
+                f"Dataset too large for full dot-product matrix (n={n}). "
+                f"Skipping full computation; will sample in visualization."
+            )
+            return None
         dot_product_matrix = residuals @ residuals.T
         return dot_product_matrix
 
@@ -290,6 +367,50 @@ class StylizedResiduals:
         print(f"\nAverage style vector computed with dimension {len(avg_style_vector)}")
         return avg_style_vector
 
+    def _stratified_sample_indices(self, values, sample_size, bins=10, random_state=42):
+        """
+        Stratified sample indices based on the distribution of `values`.
+        """
+        rng = np.random.default_rng(random_state)
+        if sample_size >= len(values):
+            return np.arange(len(values))
+        quantiles = np.quantile(values, np.linspace(0.0, 1.0, bins + 1))
+        indices = np.arange(len(values))
+        sampled = []
+        per_bin = max(1, sample_size // bins)
+        for b in range(bins):
+            mask = (values >= quantiles[b]) & (values <= quantiles[b + 1] + 1e-12)
+            bin_indices = indices[mask]
+            if len(bin_indices) == 0:
+                continue
+            take = min(per_bin, len(bin_indices))
+            chosen = rng.choice(bin_indices, size=take, replace=False)
+            sampled.append(chosen)
+        sampled = np.concatenate(sampled) if len(sampled) else rng.choice(indices, size=sample_size, replace=False)
+        #if we sampled slightly less due to empty bins, top up randomly
+        if len(sampled) < sample_size:
+            remaining = np.setdiff1d(indices, sampled)
+            top_up = rng.choice(remaining, size=sample_size - len(sampled), replace=False)
+            sampled = np.concatenate([sampled, top_up])
+        return sampled
+
+    def compute_topk_neighbor_similarities(self, residuals, k=None):
+        """
+        Compute top-k cosine neighbor similarities for each residual without full N^2.
+        Returns similarities (n, k).
+        """
+        if k is None:
+            k = self.topk_neighbors
+        k = min(k, max(1, len(residuals) - 1))
+        residuals_norm = normalize(residuals, axis=1)
+        nn = NearestNeighbors(n_neighbors=k + 1, metric='cosine')
+        nn.fit(residuals_norm)
+        distances, indices = nn.kneighbors(residuals_norm, return_distance=True)
+        #skip self neighbor at position 0
+        distances = distances[:, 1:]
+        sims = 1.0 - distances
+        return sims
+
     def visualize(self, residuals, similarity_matrix, dot_product_matrix, 
                   residual_norms, output_path='style_residuals_analysis.png'):
         """
@@ -303,59 +424,77 @@ class StylizedResiduals:
             output_path: Path to save visualization
         """
         fig, axes = plt.subplots(2, 2, figsize=(14, 12))
-        
         num_samples = len(residuals)
-        
-        #plot 1: Cosine Similarity Heatmap
-        sns.heatmap(similarity_matrix, annot=True, fmt='.3f', cmap='coolwarm', 
-                    center=0.5, vmin=0, vmax=1,
-                    xticklabels=[f'Pair {i+1}' for i in range(num_samples)],
-                    yticklabels=[f'Pair {i+1}' for i in range(num_samples)],
-                    ax=axes[0, 0], cbar_kws={'label': 'Cosine Similarity'})
-        axes[0, 0].set_title('Cosine Similarity Between Style Residuals\n(High values = consistent style direction)', 
-                              fontsize=12, fontweight='bold')
 
-        #plot 2: Dot Product Heatmap
-        sns.heatmap(dot_product_matrix, annot=True, fmt='.1f', cmap='viridis',
-                    xticklabels=[f'Pair {i+1}' for i in range(num_samples)],
-                    yticklabels=[f'Pair {i+1}' for i in range(num_samples)],
-                    ax=axes[0, 1], cbar_kws={'label': 'Dot Product'})
-        axes[0, 1].set_title('Dot Products Between Style Residuals\n(Includes magnitude information)', 
-                              fontsize=12, fontweight='bold')
+        #compute cosine sims to avg (vectorized)
+        avg_vec = residuals.mean(axis=0)
+        cos_sims = (residuals @ avg_vec) / (
+            np.clip(np.linalg.norm(residuals, axis=1), 1e-12, None) * (np.linalg.norm(avg_vec) + 1e-12)
+        )
 
-        #plot 3: Residual Magnitudes
-        colors = plt.cm.viridis(np.linspace(0, 1, num_samples))
-        bars = axes[1, 0].bar(range(1, num_samples + 1), residual_norms, color=colors)
-        axes[1, 0].set_xlabel('Sentence Pair', fontsize=11)
-        axes[1, 0].set_ylabel('L2 Norm', fontsize=11)
-        axes[1, 0].set_title('Magnitude of Style Residuals\n(How different are the embeddings?)', 
-                              fontsize=12, fontweight='bold')
-        axes[1, 0].set_xticks(range(1, num_samples + 1))
-        axes[1, 0].grid(axis='y', alpha=0.3)
-        for i, (bar, norm) in enumerate(zip(bars, residual_norms)):
-            axes[1, 0].text(bar.get_x() + bar.get_width()/2, 
-                           bar.get_height() + max(residual_norms)*0.01,
-                           f'{norm:.2f}', ha='center', va='bottom', fontsize=10)
+        #top-left: Cosine Similarity Heatmap (full or sampled)
+        if similarity_matrix is not None and len(similarity_matrix) <= self.max_heatmap_sample_size:
+            sns.heatmap(
+                similarity_matrix,
+                annot=False,
+                cmap='coolwarm', center=0.5, vmin=0, vmax=1,
+                xticklabels=False, yticklabels=False,
+                ax=axes[0, 0], cbar_kws={'label': 'Cosine Similarity'}
+            )
+            axes[0, 0].set_title(
+                'Pairwise Cosine Similarity (full)', fontsize=12, fontweight='bold'
+            )
+        else:
+            #sample for heatmap
+            m = min(self.max_heatmap_sample_size, num_samples)
+            idx = self._stratified_sample_indices(residual_norms, m)
+            res_norm = normalize(residuals[idx], axis=1)
+            sim_sample = res_norm @ res_norm.T
+            sns.heatmap(
+                sim_sample, annot=False, cmap='coolwarm', center=0.5, vmin=0, vmax=1,
+                xticklabels=False, yticklabels=False, ax=axes[0, 0],
+                cbar_kws={'label': 'Cosine Similarity'}
+            )
+            axes[0, 0].set_title(
+                f'Pairwise Cosine Similarity (sampled n={m})', fontsize=12, fontweight='bold'
+            )
 
-        #plot 4: PCA visualization of residuals
-        if len(residuals) > 1:
-            pca = PCA(n_components=min(2, len(residuals)))
+        #top-right: PCA 2D view (scatter or hexbin) colored by cosine to avg
+        if num_samples > 1:
+            pca = PCA(n_components=2)
             residuals_pca = pca.fit_transform(residuals)
-            
-            axes[1, 1].scatter(residuals_pca[:, 0], residuals_pca[:, 1], 
-                               s=200, c=colors, alpha=0.7, edgecolors='black', linewidth=1.5)
-            for i, (x, y) in enumerate(residuals_pca):
-                axes[1, 1].annotate(f'Pair {i+1}', (x, y), 
-                                   xytext=(10, 10), textcoords='offset points',
-                                   fontsize=10, fontweight='bold')
-            axes[1, 1].axhline(0, color='gray', linestyle='--', alpha=0.3)
-            axes[1, 1].axvline(0, color='gray', linestyle='--', alpha=0.3)
-            axes[1, 1].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} variance)', fontsize=11)
-            if len(pca.explained_variance_ratio_) > 1:
-                axes[1, 1].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} variance)', fontsize=11)
-            axes[1, 1].set_title('PCA of Style Residuals\n(Do they cluster?)', 
-                                  fontsize=12, fontweight='bold')
-            axes[1, 1].grid(alpha=0.3)
+            if num_samples <= self.max_scatter_points:
+                sc = axes[0, 1].scatter(
+                    residuals_pca[:, 0], residuals_pca[:, 1],
+                    c=cos_sims, cmap='viridis', s=20, alpha=0.7, edgecolors='none'
+                )
+            else:
+                hb = axes[0, 1].hexbin(
+                    residuals_pca[:, 0], residuals_pca[:, 1],
+                    C=cos_sims, reduce_C_function=np.mean, gridsize=40, cmap='viridis'
+                )
+                sc = hb
+            axes[0, 1].axhline(0, color='gray', linestyle='--', alpha=0.3)
+            axes[0, 1].axvline(0, color='gray', linestyle='--', alpha=0.3)
+            axes[0, 1].set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%})', fontsize=11)
+            axes[0, 1].set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%})', fontsize=11)
+            axes[0, 1].set_title('PCA of Residuals (color = cosine to avg)', fontsize=12, fontweight='bold')
+            cbar = fig.colorbar(sc, ax=axes[0, 1])
+            cbar.set_label('Cosine to Average Vector')
+
+        #bottom-left: Residual magnitude distribution
+        axes[1, 0].hist(residual_norms, bins=40, color='#4C78A8', alpha=0.85)
+        axes[1, 0].set_xlabel('L2 Norm', fontsize=11)
+        axes[1, 0].set_ylabel('Count', fontsize=11)
+        axes[1, 0].set_title('Distribution of Residual Magnitudes', fontsize=12, fontweight='bold')
+        axes[1, 0].grid(axis='y', alpha=0.3)
+
+        #bottom-right: Cosine to average vector distribution
+        axes[1, 1].hist(cos_sims, bins=40, color='#F58518', alpha=0.85)
+        axes[1, 1].set_xlabel('Cosine Similarity', fontsize=11)
+        axes[1, 1].set_ylabel('Count', fontsize=11)
+        axes[1, 1].set_title('Distribution: Cosine to Average Style Vector', fontsize=12, fontweight='bold')
+        axes[1, 1].grid(axis='y', alpha=0.3)
 
         plt.tight_layout()
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
@@ -401,16 +540,29 @@ class StylizedResiduals:
                            self.output_data_path.replace('.csv', '_unstylized.csv'))
         
         residuals = self.compute_residuals(stylized_sentences, unstylized_sentences)
+        n = len(residuals)
         
         residual_norms = self.analyze_magnitudes(residuals)
         
         avg_style_vector = self.compute_average_vector(residuals)
         
         cosine_sims = self.compute_cosine_similarities(residuals, avg_style_vector)
+        
+        #avoid full O(N^2) for large N; matrices will be sampled in visualize
         similarity_matrix = self.compute_similarity_matrix(residuals)
         dot_product_matrix = self.compute_dot_products(residuals)
         
-        self.visualize(residuals, similarity_matrix, dot_product_matrix, residual_norms)
+        #compute local structure stats without full matrix
+        topk_sims = self.compute_topk_neighbor_similarities(residuals)
+        topk_summary = {
+            'k': topk_sims.shape[1] if topk_sims.ndim == 2 else 0,
+            'mean': float(np.mean(topk_sims)) if topk_sims.size else None,
+            'median': float(np.median(topk_sims)) if topk_sims.size else None,
+            'std': float(np.std(topk_sims)) if topk_sims.size else None,
+        }
+        print("\nLocal similarity (top-k cosine) summary:", topk_summary)
+        
+        self.visualize(residuals, similarity_matrix, dot_product_matrix, residual_norms, 'all_semantic_search.png')
         
         return {
             'residuals': residuals,
@@ -418,17 +570,55 @@ class StylizedResiduals:
             'avg_style_vector': avg_style_vector,
             'cosine_sims': cosine_sims,
             'similarity_matrix': similarity_matrix,
-            'dot_product_matrix': dot_product_matrix
+            'dot_product_matrix': dot_product_matrix,
+            'topk_sims': topk_sims,
+            'topk_summary': topk_summary,
         }
+
+    def save_results_summary(self, results_dict, output_path='results.txt'):
+        """
+        Save a concise, scalable summary of results to a text file.
+        """
+        residuals = results_dict.get('residuals')
+        residual_norms = results_dict.get('residual_norms')
+        cosine_sims = results_dict.get('cosine_sims')
+        topk_summary = results_dict.get('topk_summary')
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write("Stylized Residuals Analysis Summary\n")
+            f.write("="*40 + "\n\n")
+            if residuals is not None:
+                f.write(f"num_residuals: {len(residuals)}\n")
+                f.write(f"residual_dim: {residuals.shape[1]}\n\n")
+            if residual_norms is not None and len(residual_norms):
+                q = np.quantile(residual_norms, [0.0, 0.25, 0.5, 0.75, 1.0])
+                f.write("Residual Norms\n")
+                f.write(
+                    f"mean={residual_norms.mean():.6f} std={residual_norms.std():.6f} "
+                    f"min={q[0]:.6f} q25={q[1]:.6f} median={q[2]:.6f} q75={q[3]:.6f} max={q[4]:.6f}\n\n"
+                )
+            if cosine_sims is not None and len(cosine_sims):
+                q = np.quantile(cosine_sims, [0.0, 0.25, 0.5, 0.75, 1.0])
+                f.write("Cosine to Average Vector\n")
+                f.write(
+                    f"mean={cosine_sims.mean():.6f} std={cosine_sims.std():.6f} "
+                    f"min={q[0]:.6f} q25={q[1]:.6f} median={q[2]:.6f} q75={q[3]:.6f} max={q[4]:.6f}\n\n"
+                )
+            if topk_summary is not None:
+                f.write("Top-k Neighbor Cosine Similarities\n")
+                f.write(
+                    f"k={topk_summary.get('k')} mean={topk_summary.get('mean')} "
+                    f"median={topk_summary.get('median')} std={topk_summary.get('std')}\n"
+                )
+        print(f"Saved analysis summary to {output_path}")
 
 
 if __name__ == "__main__":
     torch.cuda.empty_cache()
 
     analyzer = StylizedResiduals(
-        original_text_path='..data/kafka_sentences_merged.csv',
-        output_data_path='..data/kafka_unstylized_sentences.csv', 
-        stripped_text_path='..data/kafka_unstylized_sentences_checkpoint.csv'
+        original_text_path='data/withering_heights_merged.csv',
+        output_data_path='data/withering_heights_stripped_checkpoint.csv', 
+        stripped_text_path='data/withering_heights_stripped_checkpoint.csv'
     )
 
     stylized_df = pd.read_csv(analyzer.original_text_path)
@@ -438,9 +628,7 @@ if __name__ == "__main__":
     unstyled_list = unstyled_df["unstylized"].tolist()
 
     results = analyzer.run_full_analysis(stylized_list, unstyled_list)
-
-
-    analyzer.save_to_csv(results, 'results.txt')
+    analyzer.save_results_summary(results, 'results.txt')
 
 
     
