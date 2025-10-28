@@ -8,6 +8,12 @@ from sklearn.preprocessing import normalize
 from sklearn.neighbors import NearestNeighbors
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score
+from sklearn.utils import resample
+from scipy import stats
+import re
 
 import os 
 os.chdir('..')
@@ -44,6 +50,9 @@ class StylizedResiduals:
         self.max_heatmap_sample_size = 200  # cap for pairwise heatmaps
         self.max_scatter_points = 5000      # cap before switching to hexbin
         self.topk_neighbors = 10            # for local similarity stats
+        self.random_state = 42
+        self.max_occlusion_pairs = 25
+        self.quiver_max_arrows = 800
 
     def _ensure_translator_loaded(self):
         if self.translator is None or self.tokenizer is None:
@@ -411,6 +420,267 @@ class StylizedResiduals:
         sims = 1.0 - distances
         return sims
 
+    def encode_pairs(self, stylized, unstylized, batch_size=64, show_progress_bar=True):
+        """
+        Encode stylized and unstylized sentences and return embeddings and residuals.
+        Returns (stylized_enc, unstylized_enc, residuals).
+        """
+        stylized_enc = self._encode_with_retry(stylized, batch_size=batch_size, show_progress_bar=show_progress_bar)
+        unstylized_enc = self._encode_with_retry(unstylized, batch_size=batch_size, show_progress_bar=show_progress_bar)
+        residuals = stylized_enc - unstylized_enc
+        print(f"Encoded pairs: {len(residuals)} residuals with dim {residuals.shape[1]}")
+        return stylized_enc, unstylized_enc, residuals
+
+    def linear_probe_style_direction(self, stylized_enc, unstylized_enc, residuals, avg_style_vector=None):
+        """
+        Train a linear probe to separate stylized vs unstylized embeddings.
+        Returns dict with supervised direction, cosine to avg vector, and energy stats.
+        """
+        X = np.vstack([stylized_enc, unstylized_enc])
+        y = np.array([1] * len(stylized_enc) + [0] * len(unstylized_enc))
+        clf = LogisticRegression(max_iter=1000)
+        clf.fit(X, y)
+        w = clf.coef_.ravel()
+        w_norm = np.linalg.norm(w) + 1e-12
+        w = w / w_norm
+        if avg_style_vector is None:
+            avg_style_vector = residuals.mean(axis=0)
+        v = avg_style_vector / (np.linalg.norm(avg_style_vector) + 1e-12)
+        cos_wa = float(np.clip(w @ v, -1.0, 1.0))
+        on_w = residuals @ w
+        on_v = residuals @ v
+        energy_w = float(np.mean(on_w ** 2))
+        energy_v = float(np.mean(on_v ** 2))
+        return {
+            'w': w,
+            'cos_w_vs_avg': cos_wa,
+            'energy_on_w': energy_w,
+            'energy_on_avg': energy_v,
+        }
+
+    def svd_residual_analysis(self, residuals):
+        """
+        Perform SVD on mean-centered residuals. Return singular values, explained variance,
+        cumulative explained, and participation ratio.
+        """
+        R = residuals - residuals.mean(axis=0, keepdims=True)
+        U_svd, s, Vt = np.linalg.svd(R, full_matrices=False)
+        power = s ** 2
+        total = float(np.sum(power)) + 1e-12
+        explained = power / total
+        cumulative = np.cumsum(explained)
+        participation_ratio = float((np.sum(explained) ** 2) / (np.sum(explained ** 2) + 1e-12))
+        return {
+            'singular_values': s,
+            'explained': explained,
+            'cumulative': cumulative,
+            'participation_ratio': participation_ratio,
+        }
+
+    def angle_diagnostics(self, residuals, directions_dict):
+        """
+        Compute angle distributions (degrees) between residuals and provided unit directions.
+        directions_dict: {name: vector}
+        Returns {name: angles_deg_array}
+        """
+        res_unit = residuals / (np.linalg.norm(residuals, axis=1, keepdims=True) + 1e-12)
+        out = {}
+        for name, vec in directions_dict.items():
+            v = vec / (np.linalg.norm(vec) + 1e-12)
+            cos = np.clip(res_unit @ v, -1.0, 1.0)
+            angles_deg = np.degrees(np.arccos(cos))
+            out[name] = angles_deg
+        return out
+
+    def plot_quiver_arrows(self, stylized_enc, unstylized_enc, output_path='style_flow_quiver.png'):
+        """
+        2D PCA projection with arrows from unstylized to stylized embeddings.
+        """
+        if len(unstylized_enc) == 0:
+            return
+        X = np.vstack([unstylized_enc, stylized_enc])
+        pca = PCA(n_components=2)
+        X2 = pca.fit_transform(X)
+        n = len(unstylized_enc)
+        U2 = X2[:n]
+        S2 = X2[n:]
+        rng = np.random.default_rng(self.random_state)
+        idx = rng.choice(n, size=min(self.quiver_max_arrows, n), replace=False)
+        plt.figure(figsize=(8, 6))
+        plt.quiver(U2[idx, 0], U2[idx, 1], (S2 - U2)[idx, 0], (S2 - U2)[idx, 1],
+                   angles='xy', scale_units='xy', scale=1, width=0.002, alpha=0.35)
+        plt.scatter(U2[idx, 0], U2[idx, 1], s=8, c='gray', alpha=0.5)
+        plt.title('Quiver: Unstylized → Stylized (PCA-2D)')
+        plt.axis('equal')
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"Saved quiver plot to '{output_path}'")
+        plt.close()
+
+    def _has_old_english(self, text, lexicon=None):
+        if lexicon is None:
+            lexicon = {"thou", "thee", "thy", "thine", "hath", "dost", "shalt", "wherefore", "nay"}
+        for w in lexicon:
+            if re.search(rf"\b{re.escape(w)}\b", text, flags=re.IGNORECASE):
+                return True
+        return False
+
+    def lexicon_conditioned_effects(self, texts_unstylized, residuals, direction, n_permutations=2000):
+        """
+        Compare projection along a style direction for sentences with vs without lexicon words.
+        Returns dict with means, diff, t-test p, and permutation p.
+        """
+        direction = direction / (np.linalg.norm(direction) + 1e-12)
+        proj = residuals @ direction
+        mask = np.array([self._has_old_english(t) for t in texts_unstylized])
+        a = proj[mask]
+        b = proj[~mask]
+        if len(a) == 0 or len(b) == 0:
+            return {'count_with': int(len(a)), 'count_without': int(len(b)), 'diff_mean': None, 't_p': None, 'perm_p': None}
+        diff = float(a.mean() - b.mean())
+        t_p = float(stats.ttest_ind(a, b, equal_var=False).pvalue)
+        # permutation test on difference in means
+        rng = np.random.default_rng(self.random_state)
+        combined = np.concatenate([a, b])
+        n_a = len(a)
+        more_extreme = 0
+        for _ in range(n_permutations):
+            rng.shuffle(combined)
+            a_s = combined[:n_a]
+            b_s = combined[n_a:]
+            if abs(a_s.mean() - b_s.mean()) >= abs(diff):
+                more_extreme += 1
+        perm_p = (more_extreme + 1) / (n_permutations + 1)
+        return {'count_with': int(len(a)), 'count_without': int(len(b)), 'diff_mean': diff, 't_p': t_p, 'perm_p': float(perm_p)}
+
+    def token_occlusion_attribution(self, stylized_texts, unstylized_texts, direction, num_pairs=None, output_path='token_attribution.png'):
+        """
+        For a sample of pairs, remove each token in the unstylized text and measure drop
+        in cosine alignment of residual with style direction. Aggregate token contributions.
+        """
+        direction = direction / (np.linalg.norm(direction) + 1e-12)
+        rng = np.random.default_rng(self.random_state)
+        n = len(unstylized_texts)
+        if num_pairs is None:
+            num_pairs = min(self.max_occlusion_pairs, n)
+        idx = rng.choice(n, size=num_pairs, replace=False)
+        token_contribs = {}
+        for i in idx:
+            t_u = unstylized_texts[i]
+            t_s = stylized_texts[i]
+            base_u = self._encode_with_retry([t_u], batch_size=1, show_progress_bar=False)[0]
+            s = self._encode_with_retry([t_s], batch_size=1, show_progress_bar=False)[0]
+            base_res = s - base_u
+            base_score = float((base_res @ direction) / (np.linalg.norm(base_res) * 1.0 + 1e-12))
+            tokens = t_u.split()
+            for j in range(len(tokens)):
+                alt = " ".join(tokens[:j] + tokens[j+1:]) if len(tokens) > 1 else ""
+                alt_u = self._encode_with_retry([alt], batch_size=1, show_progress_bar=False)[0]
+                res = s - alt_u
+                score = float((res @ direction) / (np.linalg.norm(res) * 1.0 + 1e-12))
+                contrib = max(0.0, base_score - score)
+                token = tokens[j].lower()
+                token_contribs[token] = token_contribs.get(token, 0.0) + contrib
+        if not token_contribs:
+            return {}
+        # Plot top tokens
+        items = sorted(token_contribs.items(), key=lambda kv: kv[1], reverse=True)[:20]
+        labels = [k for k, _ in items]
+        vals = [v for _, v in items]
+        plt.figure(figsize=(8, 6))
+        sns.barplot(x=vals, y=labels, orient='h', color='#4C78A8')
+        plt.xlabel('Aggregated Contribution (Δ cosine)')
+        plt.ylabel('Token')
+        plt.title('Token Occlusion Attribution (top 20)')
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"Saved token attribution plot to '{output_path}'")
+        plt.close()
+        return token_contribs
+
+    def confound_regression(self, texts, residuals, direction):
+        """
+        Regress projection onto direction against simple textual confounds.
+        Returns dict with R^2 and coefficients.
+        """
+        direction = direction / (np.linalg.norm(direction) + 1e-12)
+        y = residuals @ direction
+        def features(text):
+            toks = text.split()
+            num_tokens = len(toks)
+            avg_tok_len = np.mean([len(t) for t in toks]) if num_tokens else 0.0
+            s = text
+            L = len(s) + 1e-12
+            counts = {
+                'len_chars': len(s),
+                'num_tokens': num_tokens,
+                'avg_tok_len': avg_tok_len,
+                'commas': s.count(','), 'semicolons': s.count(';'), 'colons': s.count(':'),
+                'dashes': s.count('-'), 'exclaims': s.count('!'), 'questions': s.count('?'),
+                'quotes': s.count('"') + s.count("'"), 'parens': s.count('(') + s.count(')'),
+                'digits_share': sum(ch.isdigit() for ch in s) / L,
+                'upper_share': sum(ch.isupper() for ch in s) / L,
+            }
+            return counts
+        feats = [features(t) for t in texts]
+        feat_names = list(feats[0].keys()) if feats else []
+        X = np.array([[f[n] for n in feat_names] for f in feats]) if feats else np.zeros((len(texts), 0))
+        if X.shape[1] == 0:
+            return {'r2': None, 'coeffs': {}}
+        lr = LinearRegression()
+        lr.fit(X, y)
+        y_hat = lr.predict(X)
+        r2 = float(r2_score(y, y_hat))
+        coeffs = {name: float(coef) for name, coef in zip(feat_names, lr.coef_)}
+        return {'r2': r2, 'coeffs': coeffs}
+
+    def visualize_extended(self, residuals, directions, topk_sims=None, svd_info=None, output_path='style_residuals_analysis_ext.png'):
+        """
+        Extended figure: SVD spectrum, cumulative, angles, neighbor sims, energy along dir.
+        directions: dict {name: vector}
+        """
+        ncols = 3
+        fig, axes = plt.subplots(2, ncols, figsize=(16, 10))
+        # SVD spectrum
+        if svd_info is not None:
+            s = svd_info['singular_values']
+            explained = svd_info['explained']
+            axes[0, 0].plot(s, marker='o')
+            axes[0, 0].set_title('Singular Values')
+            axes[1, 0].plot(np.cumsum(explained))
+            axes[1, 0].set_ylim(0, 1)
+            axes[1, 0].set_title('Cumulative Explained Variance')
+        else:
+            axes[0, 0].text(0.5, 0.5, 'No SVD', ha='center', va='center')
+            axes[1, 0].text(0.5, 0.5, 'No SVD', ha='center', va='center')
+        # Angles
+        angle_map = self.angle_diagnostics(residuals, directions)
+        for name, angles in angle_map.items():
+            axes[0, 1].hist(angles, bins=40, alpha=0.6, label=name)
+        axes[0, 1].set_title('Angles to Directions (deg)')
+        axes[0, 1].legend()
+        # Neighbor sims
+        if topk_sims is not None and topk_sims.size:
+            axes[1, 1].hist(topk_sims.flatten(), bins=40, color='#54a24b', alpha=0.8)
+            axes[1, 1].set_title('Top-k Neighbor Cosine Sims')
+        else:
+            axes[1, 1].text(0.5, 0.5, 'No kNN sims', ha='center', va='center')
+        # Energy along first direction
+        first_name = next(iter(directions))
+        d = directions[first_name]
+        d = d / (np.linalg.norm(d) + 1e-12)
+        proj = (residuals @ d)
+        axes[0, 2].hist(proj, bins=40, color='#F58518', alpha=0.85)
+        axes[0, 2].set_title(f'Projection on {first_name}')
+        # Residual norms
+        norms = np.linalg.norm(residuals, axis=1)
+        axes[1, 2].hist(norms, bins=40, color='#4C78A8', alpha=0.85)
+        axes[1, 2].set_title('Residual Norms')
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"Saved extended visualization to '{output_path}'")
+        plt.close()
+
     def visualize(self, residuals, similarity_matrix, dot_product_matrix, 
                   residual_norms, output_path='style_residuals_analysis.png'):
         """
@@ -539,7 +809,7 @@ class StylizedResiduals:
             self.save_to_csv(unstylized_sentences, 
                            self.output_data_path.replace('.csv', '_unstylized.csv'))
         
-        residuals = self.compute_residuals(stylized_sentences, unstylized_sentences)
+        stylized_enc, unstylized_enc, residuals = self.encode_pairs(stylized_sentences, unstylized_sentences)
         n = len(residuals)
         
         residual_norms = self.analyze_magnitudes(residuals)
@@ -563,6 +833,23 @@ class StylizedResiduals:
         print("\nLocal similarity (top-k cosine) summary:", topk_summary)
         
         self.visualize(residuals, similarity_matrix, dot_product_matrix, residual_norms, 'all_semantic_search.png')
+        # Extended analyses and artifacts
+        probe = self.linear_probe_style_direction(stylized_enc, unstylized_enc, residuals, avg_style_vector)
+        print(f"Supervised vs Avg direction cosine: {probe['cos_w_vs_avg']:.4f}")
+        svd_info = self.svd_residual_analysis(residuals)
+        self.plot_quiver_arrows(stylized_enc, unstylized_enc, output_path='style_flow_quiver.png')
+        directions = {'avg': avg_style_vector, 'probe_w': probe['w']}
+        self.visualize_extended(residuals, directions, topk_sims=topk_sims, svd_info=svd_info, output_path='style_residuals_analysis_ext.png')
+        # Lexicon-conditioned effects
+        lex_avg = self.lexicon_conditioned_effects(unstylized_sentences, residuals, avg_style_vector)
+        lex_w = self.lexicon_conditioned_effects(unstylized_sentences, residuals, probe['w'])
+        print("Lexicon-conditioned differences (avg):", lex_avg)
+        print("Lexicon-conditioned differences (w):", lex_w)
+        # Token occlusion attribution (sampled)
+        _ = self.token_occlusion_attribution(stylized_sentences, unstylized_sentences, probe['w'], num_pairs=None, output_path='token_attribution.png')
+        # Confound regression
+        confounds = self.confound_regression(unstylized_sentences, residuals, probe['w'])
+        print("Confound regression:", confounds)
         
         return {
             'residuals': residuals,
@@ -573,6 +860,13 @@ class StylizedResiduals:
             'dot_product_matrix': dot_product_matrix,
             'topk_sims': topk_sims,
             'topk_summary': topk_summary,
+            'stylized_enc': stylized_enc,
+            'unstylized_enc': unstylized_enc,
+            'probe': probe,
+            'svd_info': svd_info,
+            'lexicon_avg': lex_avg,
+            'lexicon_w': lex_w,
+            'confounds': confounds,
         }
 
     def save_results_summary(self, results_dict, output_path='results.txt'):
@@ -616,9 +910,9 @@ if __name__ == "__main__":
     torch.cuda.empty_cache()
 
     analyzer = StylizedResiduals(
-        original_text_path='data/withering_heights_merged.csv',
-        output_data_path='data/withering_heights_stripped_checkpoint.csv', 
-        stripped_text_path='data/withering_heights_stripped_checkpoint.csv'
+        original_text_path='data/bronte/withering_heights_merged.csv',
+        output_data_path='data/bronte/withering_heights_stripped_checkpoint.csv', 
+        stripped_text_path='data/bronte/withering_heights_stripped_checkpoint.csv'
     )
 
     stylized_df = pd.read_csv(analyzer.original_text_path)
