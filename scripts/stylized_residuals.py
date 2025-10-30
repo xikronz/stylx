@@ -307,6 +307,59 @@ class StylizedResiduals:
                 f"min={q[0]:.4f} q25={q[1]:.4f} median={q[2]:.4f} q75={q[3]:.4f} max={q[4]:.4f}"
             )
 
+        # Statistical significance test
+        print("\n" + "-" * 60)
+        print("STATISTICAL SIGNIFICANCE TEST (Permutation Test)")
+        print("-" * 60)
+        
+        # Compute test statistic: mean cosine similarity
+        observed_mean = np.mean(cosines)
+        
+        # Permutation test: randomly shuffle residuals and compute mean cosine similarity
+        n_permutations = 10000
+        permuted_means = []
+        
+        for _ in range(n_permutations):
+            # Randomly shuffle the residuals
+            permuted_indices = np.random.permutation(len(residuals))
+            permuted_residuals = residuals[permuted_indices]
+            
+            # Compute cosine similarities with permuted residuals
+            perm_denom = (np.linalg.norm(permuted_residuals, axis=1) * 
+                         (np.linalg.norm(avg_style_vector) + 1e-12))
+            perm_cosines = (permuted_residuals @ avg_style_vector) / np.clip(perm_denom, 1e-12, None)
+            permuted_means.append(np.mean(perm_cosines))
+        
+        permuted_means = np.array(permuted_means)
+        
+        # Compute p-value (two-tailed test)
+        p_value = np.mean(np.abs(permuted_means) >= np.abs(observed_mean))
+        
+        print(f"Observed mean cosine similarity: {observed_mean:.4f}")
+        print(f"Permutation test p-value (two-tailed): {p_value:.4f}")
+        
+        # Also compute one-sample t-test against 0
+        t_stat, t_pvalue = stats.ttest_1samp(cosines, 0)
+        print(f"\nOne-sample t-test against 0:")
+        print(f"  t-statistic: {t_stat:.4f}")
+        print(f"  p-value: {t_pvalue:.4e}")
+        
+        # Effect size (Cohen's d)
+        cohens_d = observed_mean / (np.std(cosines, ddof=1) + 1e-12)
+        print(f"  Cohen's d: {cohens_d:.4f}")
+        
+        # Interpretation
+        if p_value < 0.001:
+            significance = "highly significant (p < 0.001)"
+        elif p_value < 0.01:
+            significance = "very significant (p < 0.01)"
+        elif p_value < 0.05:
+            significance = "significant (p < 0.05)"
+        else:
+            significance = "not significant (p >= 0.05)"
+        
+        print(f"\nResult: The cosine similarities are {significance}")
+
         return cosines
 
     def compute_similarity_matrix(self, residuals):
@@ -911,11 +964,10 @@ if __name__ == "__main__":
 
     analyzer = StylizedResiduals(
         original_text_path='data/bronte/withering_heights_merged.csv',
-        output_data_path='data/bronte/withering_heights_stripped_checkpoint.csv', 
-        stripped_text_path='data/bronte/withering_heights_stripped_checkpoint.csv'
+        output_data_path='data/kafka/kafka_unstylized_sentences_checkpoint.csv', 
+        stripped_text_path='data/kafka/kafka_unstylized_sentences_checkpoint.csv'
     )
 
-    stylized_df = pd.read_csv(analyzer.original_text_path)
     unstyled_df = pd.read_csv(analyzer.stripped_text_path)
 
     stylized_list = unstyled_df["original"].tolist()
